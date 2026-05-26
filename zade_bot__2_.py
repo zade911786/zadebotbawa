@@ -176,6 +176,11 @@ async def init_db():
             credits  INTEGER DEFAULT 2,
             last_reset TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS img6_credits (
+            user_id  INTEGER PRIMARY KEY,
+            credits  INTEGER DEFAULT 2,
+            last_reset TEXT DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS imgpro_credits (
             user_id  INTEGER PRIMARY KEY,
             credits  INTEGER DEFAULT 2,
@@ -1548,6 +1553,69 @@ async def cmd_clone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_clone_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle freeform text during clone setup — only fires if user is in active clone flow."""
     u = update.effective_user
+
+    # ── /img6 custom reply to duck.ai ───────────────────────────────
+    i6 = IMG6_STATE.get(u.id, {})
+    if i6.get("awaiting_reply"):
+        request_id = i6["awaiting_reply"]
+        user_reply = update.message.text.strip()
+        prompt     = i6.get("prompt", "")
+        IMG6_STATE[u.id].pop("awaiting_reply", None)
+        import aiohttp as _ah
+        wm = await update.message.reply_text(
+            f"💬 <b>Sent to duck.ai:</b> <code>{user_reply[:60]}</code>\n⏳ Waiting...",
+            parse_mode="HTML"
+        )
+        try:
+            async with _ah.ClientSession() as session:
+                async with session.post(
+                    f"{DDG_API_BASE}/image/reply",
+                    json={"id": request_id, "message": user_reply},
+                    timeout=_ah.ClientTimeout(total=15)
+                ) as r:
+                    await r.json(content_type=None)
+            result = await _ddg_poll(request_id, "image")
+            try: await wm.delete()
+            except: pass
+            if result.get("status") == "needs_reply":
+                question = result.get("text", "duck.ai asked again.")
+                await update.message.reply_text(
+                    f"❓ <b>duck.ai asks:</b>\n\n<i>{question}</i>",
+                    parse_mode="HTML",
+                    api_kwargs={"reply_markup": kb_img6_reply(request_id, question)},
+                )
+            elif result.get("status") == "done" and result.get("images"):
+                is_owner = (u.id == OWNER_ID)
+                if not is_owner:
+                    await deduct_model_credit(u.id, "img6_credits")
+                    cl = await get_model_credits(u.id, "img6_credits")
+                    credits_line = f"📸 Credits Left • <b>{cl}</b> remaining today"
+                else:
+                    credits_line = "👑 Owner Access • Unlimited"
+                uname = f"@{u.username}" if u.username else (u.first_name or "User")
+                caption = (
+                    f"✨ <b>Image Generated! — duck.ai</b>\n"
+                    f"╭━━━━━━━━━━━━━━━━━━╮\n"
+                    f"│ 👤 User » {uname}\n"
+                    f"│ 🤖 Model » {result.get('model','GPT Image 2')}\n"
+                    f"│ 📝 Prompt » {prompt[:55]}{'...' if len(prompt)>55 else ''}\n"
+                    f"╰━━━━━━━━━━━━━━━━━━╯\n"
+                    f"{credits_line}\n\n🔁 <b>Regenerate or done:</b>"
+                )
+                await update.message.reply_photo(
+                    photo=result["images"][0], caption=caption, parse_mode="HTML",
+                    api_kwargs={"reply_markup": kb_img6_regen(prompt)},
+                )
+            else:
+                err = result.get("error", "No images")
+                await update.message.reply_text(f"❌ <code>{err}</code>", parse_mode="HTML")
+        except Exception as e:
+            try: await wm.delete()
+            except: pass
+            await update.message.reply_text(f"❌ DDG reply error: {e}")
+        return
+    # ────────────────────────────────────────────────────────────────
+
     state = CLONE_STEPS.get(u.id)
     # No active clone session → ignore, don't reply
     if not state:
@@ -1741,6 +1809,229 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     u    = q.from_user
     await q.answer()
+
+    # ── img5 style selection ────────────────────────────────────────
+    if data.startswith("i5s:"):
+        # i5s:<style>:<safe_prompt>
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            _, style, safe_p = parts
+            # Try full prompt from state, else fallback to safe_p
+            full_prompt = IMG5_STATE.get(u.id, {}).get("prompt", safe_p)
+            IMG5_STATE.setdefault(u.id, {})["style"] = style
+            style_label = next((l for l, v in PRODIA_STYLES if v == style), style)
+            try:
+                await q.edit_message_text(
+                    f"🖼 <b>Step 2 — Pick Aspect Ratio</b>\n\n"
+                    f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n"
+                    f"🎨 Style: <b>{style_label}</b>\n\n"
+                    f"Choose aspect ratio:",
+                    parse_mode="HTML",
+                    api_kwargs={"reply_markup": kb_img5_aspects(full_prompt, style)},
+                )
+            except Exception:
+                pass
+        return
+
+    if data.startswith("i5a:"):
+        # i5a:<aspect>:<safe_style>:<safe_prompt>
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            _, aspect, safe_s, safe_p = parts
+            state = IMG5_STATE.get(u.id, {})
+            full_prompt = state.get("prompt", safe_p)
+            style = state.get("style", safe_s)
+            IMG5_STATE.setdefault(u.id, {})["aspect"] = aspect
+            # Remove keyboard, then generate
+            try: await q.edit_message_reply_markup(reply_markup=None)
+            except: pass
+            class _FakeUpdate:
+                def __init__(self, msg):
+                    self.message = msg
+                    self.effective_chat = msg.chat
+                    self.effective_user = u
+            await _do_prodia_gen(_FakeUpdate(q.message), u, full_prompt, style, aspect)
+        return
+
+    if data.startswith("i5_back:"):
+        safe_p = data[8:]
+        full_prompt = IMG5_STATE.get(u.id, {}).get("prompt", safe_p)
+        try:
+            await q.edit_message_text(
+                f"🎨 <b>Step 1 — Pick a Style</b>\n\n"
+                f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n\n"
+                f"Choose an art style:",
+                parse_mode="HTML",
+                api_kwargs={"reply_markup": kb_img5_styles(full_prompt)},
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("i5_chstyle:"):
+        safe_p = data[11:]
+        full_prompt = IMG5_STATE.get(u.id, {}).get("prompt", safe_p)
+        try:
+            await q.message.reply_text(
+                f"🎨 <b>Change Style</b>\n\n"
+                f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n\n"
+                f"Pick a new style:",
+                parse_mode="HTML",
+                api_kwargs={"reply_markup": kb_img5_styles(full_prompt)},
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("i5_chaspect:"):
+        rest = data[12:]
+        safe_s, safe_p = rest.split(":", 1) if ":" in rest else (rest, "")
+        state = IMG5_STATE.get(u.id, {})
+        full_prompt = state.get("prompt", safe_p)
+        style = state.get("style", safe_s)
+        try:
+            await q.message.reply_text(
+                f"🖼 <b>Change Aspect Ratio</b>\n\n"
+                f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n\n"
+                f"Pick a new aspect:",
+                parse_mode="HTML",
+                api_kwargs={"reply_markup": kb_img5_aspects(full_prompt, style)},
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("i5_regen:"):
+        # i5_regen:<safe_style>:<safe_aspect>:<safe_prompt>
+        rest = data[9:]
+        parts = rest.split(":", 2)
+        if len(parts) == 3:
+            safe_s, safe_a, safe_p = parts
+            state = IMG5_STATE.get(u.id, {})
+            full_prompt = state.get("prompt", safe_p)
+            style  = state.get("style",  safe_s)
+            aspect = state.get("aspect", safe_a)
+            await q.answer("🔁 Regenerating...")
+            try: await q.edit_message_reply_markup(reply_markup=None)
+            except: pass
+            class _FakeUpdate:
+                def __init__(self, msg):
+                    self.message = msg
+                    self.effective_chat = msg.chat
+                    self.effective_user = u
+            await _do_prodia_gen(_FakeUpdate(q.message), u, full_prompt, style, aspect)
+        return
+
+    if data == "i5_cancel":
+        IMG5_STATE.pop(u.id, None)
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        await q.answer("✅ Cancelled.")
+        return
+
+    # ── img6 (DDG duck.ai) callbacks ─────────────────────────────────
+    if data.startswith("i6_regen:"):
+        safe_p = data[9:]
+        full_prompt = IMG6_STATE.get(u.id, {}).get("prompt", safe_p)
+        await q.answer("🔁 Regenerating...")
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        await _do_ddg_gen(q.message, u, full_prompt)
+        return
+
+    if data == "i6_done":
+        IMG6_STATE.pop(u.id, None)
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        await q.answer("✅ Done!")
+        return
+
+    if data.startswith("i6_ans:"):
+        # i6_ans:<yes|no>:<request_id>
+        rest = data[7:]
+        answer, safe_id = rest.split(":", 1) if ":" in rest else (rest, "")
+        state = IMG6_STATE.get(u.id, {})
+        request_id = state.get("request_id", safe_id)
+        prompt = state.get("prompt", "")
+        await q.answer(f"Sending '{answer}' to duck.ai...")
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        # Send reply to DDG API
+        import aiohttp as _ah
+        wm = await q.message.reply_text(
+            f"💬 <b>Replied to duck.ai:</b> <code>{answer}</code>\n"
+            f"⏳ Waiting for result...",
+            parse_mode="HTML"
+        )
+        try:
+            async with _ah.ClientSession() as session:
+                async with session.post(
+                    f"{DDG_API_BASE}/image/reply",
+                    json={"id": request_id, "message": answer},
+                    timeout=_ah.ClientTimeout(total=15)
+                ) as r:
+                    await r.json(content_type=None)
+            # Poll for result
+            result = await _ddg_poll(request_id, "image")
+            try: await wm.delete()
+            except: pass
+            if result.get("status") == "needs_reply":
+                question = result.get("text", "duck.ai asked another question.")
+                await q.message.reply_text(
+                    f"❓ <b>duck.ai is asking again:</b>\n\n<i>{question}</i>",
+                    parse_mode="HTML",
+                    api_kwargs={"reply_markup": kb_img6_reply(request_id, question)},
+                )
+                return
+            if result.get("status") != "done" or not result.get("images"):
+                err = result.get("error", "No images returned")
+                await q.message.reply_text(f"❌ <b>Failed:</b> <code>{err}</code>", parse_mode="HTML")
+                return
+            # Success
+            is_owner = (u.id == OWNER_ID)
+            if not is_owner:
+                await deduct_model_credit(u.id, "img6_credits")
+                credits_left = await get_model_credits(u.id, "img6_credits")
+                credits_line = f"📸 Credits Left • <b>{credits_left}</b> remaining today"
+            else:
+                credits_line = "👑 Owner Access • Unlimited"
+            username_str = f"@{u.username}" if u.username else (u.first_name or "User")
+            model_str = result.get("model", "GPT Image 2")
+            caption = (
+                f"✨ <b>Image Generated! — duck.ai</b>\n"
+                f"╭━━━━━━━━━━━━━━━━━━╮\n"
+                f"│ 👤 User » {username_str}\n"
+                f"│ 🤖 Model » {model_str}\n"
+                f"│ 📝 Prompt » {prompt[:55]}{'...' if len(prompt)>55 else ''}\n"
+                f"╰━━━━━━━━━━━━━━━━━━╯\n"
+                f"{credits_line}\n\n"
+                f"🔁 <b>Regenerate or done:</b>"
+            )
+            await q.message.reply_photo(
+                photo=result["images"][0],
+                caption=caption,
+                parse_mode="HTML",
+                api_kwargs={"reply_markup": kb_img6_regen(prompt)},
+            )
+        except Exception as e:
+            try: await wm.delete()
+            except: pass
+            await q.message.reply_text(f"❌ DDG reply failed: {e}")
+        return
+
+    if data.startswith("i6_custom:"):
+        safe_id = data[10:]
+        state = IMG6_STATE.get(u.id, {})
+        request_id = state.get("request_id", safe_id)
+        IMG6_STATE.setdefault(u.id, {})["awaiting_reply"] = request_id
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+        await q.message.reply_text(
+            "💬 <b>Type your reply to duck.ai</b> as a normal message.\n"
+            "<i>Just send it in chat — bot will forward it automatically.</i>",
+            parse_mode="HTML"
+        )
+        return
 
     # ── Aspect ratio regen (img2/3/4) ───────────
     if data.startswith("aspect:"):
@@ -2340,11 +2631,46 @@ async def add_img_credits(uid, amount):
 MODEL_DAILY_FREE = 2  # daily free credits for /img2–/img5
 
 MODEL_INFO = {
-    "img2":    {"table": "img2_credits",   "model": "dalle",   "label": "DALL-E 3",     "wait": "10–60s",  "timeout": 120},
-    "img3":    {"table": "img3_credits",   "model": "gpt4o",   "label": "GPT-4o",        "wait": "40–100s", "timeout": 200},
-    "img4":    {"table": "img4_credits",   "model": "ma1",     "label": "MA-1",          "wait": "60–120s", "timeout": 240},
-    "imgpro":  {"table": "imgpro_credits", "model": "gpt_image_2_edit",  "label": "GPT IMAGE PRO", "wait": "60–120s", "timeout": 150},
+    "img2":    {"table": "img2_credits",   "model": "dalle",   "label": "DALL-E 3",       "wait": "10–60s",  "timeout": 120},
+    "img3":    {"table": "img3_credits",   "model": "gpt4o",   "label": "GPT-4o",          "wait": "40–100s", "timeout": 200},
+    "img4":    {"table": "img4_credits",   "model": "ma1",     "label": "MA-1",            "wait": "60–120s", "timeout": 240},
+    "img6":    {"table": "img6_credits",   "model": "ddg",     "label": "duck.ai GPT Img", "wait": "30–60s",  "timeout": 150},
+    "imgpro":  {"table": "imgpro_credits", "model": "gpt_image_2_edit", "label": "GPT IMAGE PRO", "wait": "60–120s", "timeout": 150},
 }
+
+# ── Prodia API config (for /img5) ────────────────────────────────
+PRODIA_API_BASE = "https://zade-prodimg-api.vercel.app/v1"
+PRODIA_STYLES = [
+    ("📷 Photographic",  "photographic"),
+    ("🎬 Cinematic",     "cinematic"),
+    ("🌸 Anime",         "anime"),
+    ("🎨 Digital Art",   "digital-art"),
+    ("🧙 Fantasy Art",   "fantasy-art"),
+    ("💥 Comic Book",    "comic-book"),
+    ("⚡ Neon Punk",     "neon-punk"),
+    ("👾 Pixel Art",     "pixel-art"),
+    ("✏️ Line Art",      "line-art"),
+    ("🔷 Low Poly",      "low-poly"),
+    ("📄 Origami",       "origami"),
+    ("🧊 3D Model",      "3d-model"),
+]
+PRODIA_ASPECTS = [
+    ("⬛ Square",    "square"),
+    ("📱 Portrait",  "portrait"),
+    ("🖼 Landscape", "landscape"),
+]
+
+# State store: {user_id: {"prompt":..., "style":..., "aspect":..., "chat_id":...}}
+IMG5_STATE: dict = {}
+
+# ── DDG API config (for /img6) ────────────────────────────────────
+DDG_API_BASE   = "https://ddg-api-iota.vercel.app/api"
+DDG_POLL_WAIT  = 30   # initial wait before first poll
+DDG_POLL_INT   = 8    # poll every 8s
+DDG_POLL_MAX   = 150  # max total wait seconds
+
+# {user_id: {"prompt":..., "request_id":..., "chat_id":..., "msg_id":...}}
+IMG6_STATE: dict = {}
 
 BING_IMG_BASE = "https://zade-bingimg-api.vercel.app/"
 
@@ -2728,16 +3054,415 @@ async def cmd_img4(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ); return
     await _do_bing_img_gen(update, u, " ".join(ctx.args).strip(), "img4")
 
-async def cmd_img5(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚠️ <b>/img5 has been removed.</b>\n\n"
-        "Try these instead:\n"
-        "• /img2 — DALL-E 3\n"
-        "• /img3 — GPT-4o\n"
-        "• /img4 — MA-1\n"
-        "• /imgpro — GPT Image Pro",
-        parse_mode="HTML"
+# ── /img5 keyboard builders ──────────────────────────────────────
+
+def kb_img5_styles(prompt: str) -> str:
+    """Style selection keyboard for /img5 — 2 per row, styled buttons."""
+    import json as _j
+    safe = prompt[:30]
+    rows = []
+    for i in range(0, len(PRODIA_STYLES), 2):
+        row = []
+        for label, val in PRODIA_STYLES[i:i+2]:
+            row.append({"text": label, "callback_data": f"i5s:{val}:{safe}", "style": "primary"})
+        rows.append(row)
+    rows.append([{"text": "❌ Cancel", "callback_data": "i5_cancel", "style": "danger"}])
+    return _j.dumps({"inline_keyboard": rows})
+
+def kb_img5_aspects(prompt: str, style: str) -> str:
+    """Aspect selection keyboard for /img5."""
+    import json as _j
+    safe_p = prompt[:25]
+    safe_s = style[:15]
+    rows = [
+        [
+            {"text": "⬛ Square",    "callback_data": f"i5a:square:{safe_s}:{safe_p}",   "style": "primary"},
+            {"text": "📱 Portrait",  "callback_data": f"i5a:portrait:{safe_s}:{safe_p}", "style": "primary"},
+            {"text": "🖼 Landscape", "callback_data": f"i5a:landscape:{safe_s}:{safe_p}","style": "primary"},
+        ],
+        [{"text": "« Back to Styles", "callback_data": f"i5_back:{safe_p}", "style": "primary"},
+         {"text": "❌ Cancel",         "callback_data": "i5_cancel",                       "style": "danger"}],
+    ]
+    return _j.dumps({"inline_keyboard": rows})
+
+def kb_img5_regen(prompt: str, style: str, aspect: str) -> str:
+    """Post-gen keyboard — regen with diff style/aspect."""
+    import json as _j
+    safe_p = prompt[:20]
+    safe_s = style[:15]
+    safe_a = aspect[:10]
+    rows = [
+        [
+            {"text": "🎨 Change Style",  "callback_data": f"i5_chstyle:{safe_p}", "style": "primary"},
+            {"text": "🖼 Change Aspect", "callback_data": f"i5_chaspect:{safe_s}:{safe_p}", "style": "primary"},
+        ],
+        [{"text": "🔁 Regenerate Same", "callback_data": f"i5_regen:{safe_s}:{safe_a}:{safe_p}", "style": "success"},
+         {"text": "❌ Done",             "callback_data": "i5_cancel", "style": "danger"}],
+    ]
+    return _j.dumps({"inline_keyboard": rows})
+
+
+async def _do_prodia_gen(update_or_msg, u, prompt: str, style: str, aspect: str, edit_msg=None):
+    """Core Prodia generation. update_or_msg can be Update or raw message."""
+    import aiohttp, urllib.parse
+
+    # resolve message object
+    if hasattr(update_or_msg, "message") and update_or_msg.message:
+        msg_obj = update_or_msg.message
+    else:
+        msg_obj = update_or_msg  # raw message (from callback)
+
+    is_owner = (u.id == OWNER_ID)
+    if not is_owner:
+        credits = await get_model_credits(u.id, "img5_credits")
+        if credits <= 0:
+            text = (
+                "❌ <b>No /img5 credits left!</b>\n\n"
+                "📸 Daily free: <b>2/day</b> (resets midnight)\n"
+                "👑 Ask owner: /addcredits5 (owner only)"
+            )
+            if edit_msg:
+                await edit_msg.edit_text(text, parse_mode="HTML")
+            else:
+                await msg_obj.reply_text(text, parse_mode="HTML")
+            return
+
+    username_str = f"@{u.username}" if u.username else (u.first_name or "User")
+    style_label  = next((l for l, v in PRODIA_STYLES if v == style), style)
+    aspect_label = next((l for _, v in [] or PRODIA_ASPECTS if v == aspect), aspect.upper())
+
+    wait_text = (
+        f"✨ <b>Generating Your Image...</b>\n"
+        f"『────────────────────』\n"
+        f"✦ 𝗠𝗼𝗱𝗲𝗹  │ <code>Prodia Flux-2</code>\n"
+        f"✦ 𝗣𝗿𝗼𝗺𝗽𝘁 │ <code>{prompt[:50]}{'...' if len(prompt)>50 else ''}</code>\n"
+        f"✦ 𝗦𝘁𝘆𝗹𝗲  │ {style_label}\n"
+        f"✦ 𝗔𝘀𝗽𝗲𝗰𝘁 │ {aspect.upper()}\n"
+        f"✦ 𝗧𝗶𝗺𝗲   │ 5–30s\n"
+        f"❖ 𝗥𝗲𝗾𝘂𝗲𝘀𝘁𝗲𝗱 𝗯𝘆 : <b>{username_str}</b>\n"
+        f"『────────────────────』\n"
+        f"<i>🖌 Crafting your exclusive creation...</i>"
     )
+
+    if edit_msg:
+        wait_msg = await edit_msg.edit_text(wait_text, parse_mode="HTML")
+    else:
+        wait_msg = await msg_obj.reply_text(wait_text, parse_mode="HTML")
+
+    start_time = time.time()
+    try:
+        enc_prompt = urllib.parse.quote_plus(prompt.strip())
+        url = f"{PRODIA_API_BASE}?prompt={enc_prompt}&style={style}&aspect={aspect}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as r:
+                resp_json = await r.json(content_type=None)
+
+        image_url = resp_json.get("image_url")
+        if not image_url:
+            err = resp_json.get("error") or resp_json.get("message") or str(resp_json)[:200]
+            try: await wait_msg.delete()
+            except: pass
+            await msg_obj.reply_text(f"❌ <b>Generation failed</b>\n<code>{err}</code>", parse_mode="HTML")
+            return
+
+        time_taken = int(time.time() - start_time)
+        dims = resp_json.get("dimensions", "—")
+
+        if not is_owner:
+            await deduct_model_credit(u.id, "img5_credits")
+            credits_left = await get_model_credits(u.id, "img5_credits")
+            credits_line = f"📸 Credits Left • <b>{credits_left}</b> remaining today"
+        else:
+            credits_line = "👑 Owner Access • Unlimited"
+
+        caption = (
+            f"✨ <b>Image Generated! — Prodia</b>\n"
+            f"╭━━━━━━━━━━━━━━━━━━╮\n"
+            f"│ 👤 User » {username_str}\n"
+            f"│ 🎭 Style » {style_label}\n"
+            f"│ 🖼 Aspect » {aspect.upper()} ({dims})\n"
+            f"│ 📝 Prompt » {prompt[:55]}{'...' if len(prompt)>55 else ''}\n"
+            f"│ ⚡ Time » {time_taken}s\n"
+            f"╰━━━━━━━━━━━━━━━━━━╯\n"
+            f"{credits_line}\n\n"
+            f"🔁 <b>Regenerate or change style/aspect:</b>"
+        )
+
+        try: await wait_msg.delete()
+        except: pass
+
+        regen_kb = kb_img5_regen(prompt, style, aspect)
+        await msg_obj.reply_photo(
+            photo=image_url,
+            caption=caption,
+            parse_mode="HTML",
+            api_kwargs={"reply_markup": regen_kb},
+        )
+
+    except asyncio.TimeoutError:
+        try: await wait_msg.delete()
+        except: pass
+        await msg_obj.reply_text("❌ Timed out (90s). Prodia API busy, try again!")
+    except Exception as e:
+        try: await wait_msg.delete()
+        except: pass
+        await msg_obj.reply_text(f"❌ Generation failed: {e}")
+
+
+async def cmd_img5(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_group(update):
+        await update.message.reply_text("❌ Groups only!"); return
+    if not ctx.args:
+        await update.message.reply_text(
+            "🎨 <b>Prodia AI Image Generator</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Usage: <code>/img5 your prompt here</code>\n\n"
+            "✦ 12 art styles to pick from\n"
+            "✦ Square / Portrait / Landscape\n"
+            "✦ Regenerate with diff style/aspect\n"
+            "✦ 2 tokens/day (free)\n\n"
+            "Example: <code>/img5 a cyberpunk city at night</code>",
+            parse_mode="HTML"
+        ); return
+
+    prompt = " ".join(ctx.args).strip()
+    # Store state so callbacks can reference full prompt
+    IMG5_STATE[u.id] = {"prompt": prompt, "chat_id": update.effective_chat.id}
+
+    await update.message.reply_text(
+        f"🎨 <b>Step 1 — Pick a Style</b>\n\n"
+        f"📝 Prompt: <code>{prompt[:60]}{'...' if len(prompt)>60 else ''}</code>\n\n"
+        f"Choose an art style:",
+        parse_mode="HTML",
+        api_kwargs={"reply_markup": kb_img5_styles(prompt)},
+    )
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /img6 — DDG (duck.ai GPT Image 2)
+# ══════════════════════════════════════════════════════════════════
+
+def kb_img6_regen(prompt: str) -> str:
+    """Post-gen keyboard for /img6."""
+    import json as _j
+    safe_p = prompt[:40]
+    return _j.dumps({"inline_keyboard": [
+        [
+            {"text": "🔁 Regenerate",     "callback_data": f"i6_regen:{safe_p}", "style": "success"},
+            {"text": "❌ Done",            "callback_data": "i6_done",             "style": "danger"},
+        ],
+    ]})
+
+def kb_img6_reply(request_id: str, question: str) -> str:
+    """Keyboard when duck.ai asks a follow-up — Yes / No / Custom reply."""
+    import json as _j
+    safe_id = request_id[:20]
+    return _j.dumps({"inline_keyboard": [
+        [
+            {"text": "✅ Yes",  "callback_data": f"i6_ans:yes:{safe_id}", "style": "success"},
+            {"text": "❌ No",   "callback_data": f"i6_ans:no:{safe_id}",  "style": "danger"},
+        ],
+        [{"text": "💬 Type Custom Reply", "callback_data": f"i6_custom:{safe_id}", "style": "primary"}],
+        [{"text": "🚫 Cancel",            "callback_data": "i6_done",              "style": "danger"}],
+    ]})
+
+
+async def _ddg_poll(request_id: str, endpoint: str = "image") -> dict:
+    """
+    Poll DDG result endpoint until done/needs_reply/error/timeout.
+    Returns the final result dict.
+    """
+    import aiohttp
+    url = f"{DDG_API_BASE}/{endpoint}/result"
+    elapsed = 0
+    await asyncio.sleep(DDG_POLL_WAIT)
+    elapsed += DDG_POLL_WAIT
+    async with aiohttp.ClientSession() as session:
+        while elapsed < DDG_POLL_MAX:
+            try:
+                async with session.post(url, json={"id": request_id},
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json(content_type=None)
+                status = data.get("status", "")
+                if status in ("done", "needs_reply", "error"):
+                    return data
+            except Exception:
+                pass
+            await asyncio.sleep(DDG_POLL_INT)
+            elapsed += DDG_POLL_INT
+    return {"status": "error", "error": "Timeout"}
+
+
+async def _do_ddg_gen(msg_obj, u, prompt: str, wait_msg=None):
+    """
+    Trigger DDG /api/image, poll, send result with regen keyboard.
+    msg_obj: the telegram Message to reply to.
+    wait_msg: existing message to delete before sending result.
+    """
+    import aiohttp
+
+    is_owner = (u.id == OWNER_ID)
+    if not is_owner:
+        credits = await get_model_credits(u.id, "img6_credits")
+        if credits <= 0:
+            text = (
+                "❌ <b>No /img6 credits left!</b>\n\n"
+                "📸 Daily free: <b>2/day</b> (resets midnight)\n"
+                "👑 Ask owner: /addcredits6 (owner only)"
+            )
+            if wait_msg:
+                try: await wait_msg.edit_text(text, parse_mode="HTML")
+                except: await msg_obj.reply_text(text, parse_mode="HTML")
+            else:
+                await msg_obj.reply_text(text, parse_mode="HTML")
+            return
+
+    username_str = f"@{u.username}" if u.username else (u.first_name or "User")
+    wait_text = (
+        f"✨ <b>Generating Your Image...</b>\n"
+        f"『────────────────────』\n"
+        f"✦ 𝗠𝗼𝗱𝗲𝗹  │ <code>GPT Image 2 (duck.ai)</code>\n"
+        f"✦ 𝗣𝗿𝗼𝗺𝗽𝘁 │ <code>{prompt[:50]}{'...' if len(prompt)>50 else ''}</code>\n"
+        f"✦ 𝗧𝗶𝗺𝗲   │ 30–60s\n"
+        f"❖ 𝗥𝗲𝗾𝘂𝗲𝘀𝘁𝗲𝗱 𝗯𝘆 : <b>{username_str}</b>\n"
+        f"『────────────────────』\n"
+        f"<i>🖌 Connecting to duck.ai... please wait!</i>"
+    )
+
+    if wait_msg:
+        try: wm = await wait_msg.edit_text(wait_text, parse_mode="HTML")
+        except: wm = await msg_obj.reply_text(wait_text, parse_mode="HTML")
+    else:
+        wm = await msg_obj.reply_text(wait_text, parse_mode="HTML")
+
+    start_time = time.time()
+    try:
+        # 1. Trigger
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{DDG_API_BASE}/image",
+                json={"prompt": prompt},
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as r:
+                trig = await r.json(content_type=None)
+
+        request_id = trig.get("request_id")
+        if not request_id:
+            err = trig.get("error") or str(trig)[:200]
+            try: await wm.delete()
+            except: pass
+            await msg_obj.reply_text(f"❌ <b>DDG trigger failed:</b> <code>{err}</code>", parse_mode="HTML")
+            return
+
+        # Store state for needs_reply handling
+        IMG6_STATE[u.id] = {"prompt": prompt, "request_id": request_id, "chat_id": msg_obj.chat_id}
+
+        # 2. Poll
+        result = await _ddg_poll(request_id, "image")
+        time_taken = int(time.time() - start_time)
+
+        try: await wm.delete()
+        except: pass
+
+        if result.get("status") == "needs_reply":
+            question = result.get("text", "duck.ai needs a reply to continue.")
+            await msg_obj.reply_text(
+                f"❓ <b>duck.ai is asking:</b>\n\n"
+                f"<i>{question}</i>\n\n"
+                f"Choose a reply:",
+                parse_mode="HTML",
+                api_kwargs={"reply_markup": kb_img6_reply(request_id, question)},
+            )
+            return
+
+        if result.get("status") != "done":
+            err = result.get("error", "Unknown error")
+            await msg_obj.reply_text(f"❌ <b>DDG generation failed:</b> <code>{err}</code>", parse_mode="HTML")
+            return
+
+        images = result.get("images", [])
+        if not images:
+            await msg_obj.reply_text("❌ DDG returned no images. Try again!", parse_mode="HTML")
+            return
+
+        if not is_owner:
+            await deduct_model_credit(u.id, "img6_credits")
+            credits_left = await get_model_credits(u.id, "img6_credits")
+            credits_line = f"📸 Credits Left • <b>{credits_left}</b> remaining today"
+        else:
+            credits_line = "👑 Owner Access • Unlimited"
+
+        result_type = result.get("type", "image")
+        model_str   = result.get("model", "GPT Image 2")
+        type_note   = " ⚠️ <i>(screenshot fallback)</i>" if result_type == "screenshot" else ""
+
+        caption = (
+            f"✨ <b>Image Generated! — duck.ai</b>{type_note}\n"
+            f"╭━━━━━━━━━━━━━━━━━━╮\n"
+            f"│ 👤 User » {username_str}\n"
+            f"│ 🤖 Model » {model_str}\n"
+            f"│ 📝 Prompt » {prompt[:55]}{'...' if len(prompt)>55 else ''}\n"
+            f"│ ⚡ Time » {time_taken}s\n"
+            f"╰━━━━━━━━━━━━━━━━━━╯\n"
+            f"{credits_line}\n\n"
+            f"🔁 <b>Regenerate or done:</b>"
+        )
+
+        regen_kb = kb_img6_regen(prompt)
+        if len(images) == 1:
+            await msg_obj.reply_photo(
+                photo=images[0],
+                caption=caption,
+                parse_mode="HTML",
+                api_kwargs={"reply_markup": regen_kb},
+            )
+        else:
+            from telegram import InputMediaPhoto
+            media = [InputMediaPhoto(media=img, caption=(caption if i == 0 else None),
+                                     parse_mode="HTML") for i, img in enumerate(images)]
+            await msg_obj.reply_media_group(media=media)
+            await msg_obj.reply_text(
+                "🔁 <b>Regenerate or done:</b>",
+                parse_mode="HTML",
+                api_kwargs={"reply_markup": regen_kb},
+            )
+
+    except asyncio.TimeoutError:
+        try: await wm.delete()
+        except: pass
+        await msg_obj.reply_text("❌ DDG API trigger timed out. Try again!")
+    except Exception as e:
+        try: await wm.delete()
+        except: pass
+        await msg_obj.reply_text(f"❌ /img6 generation failed: {e}")
+
+
+async def cmd_img6(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_group(update):
+        await update.message.reply_text("❌ Groups only!"); return
+    if not ctx.args:
+        await update.message.reply_text(
+            "🦆 <b>duck.ai Image Generator</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Usage: <code>/img6 your prompt here</code>\n\n"
+            "✦ Powered by GPT Image 2 via duck.ai\n"
+            "✦ Multi-turn — bot handles follow-up questions\n"
+            "✦ 2 tokens/day (free)\n"
+            "✦ Wait time: 30–60s\n\n"
+            "Example: <code>/img6 a neon samurai in the rain</code>",
+            parse_mode="HTML"
+        ); return
+
+    prompt = " ".join(ctx.args).strip()
+    IMG6_STATE[u.id] = {"prompt": prompt, "chat_id": update.effective_chat.id}
+    await _do_ddg_gen(update.message, u, prompt)
+
+
+async def cmd_addcredits6(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _addcredits_model(update, ctx, "img6")
 
 
 async def cmd_imgpro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3215,6 +3940,8 @@ def main():
         ("img2",           cmd_img2),
         ("img3",           cmd_img3),
         ("img4",           cmd_img4),
+        ("img5",           cmd_img5),
+        ("img6",           cmd_img6),
         ("imgpro",         cmd_imgpro),
         ("styles",         cmd_styles),
         ("imgcredits",     cmd_imgcredits),
@@ -3222,6 +3949,8 @@ def main():
         ("addcredits2",    cmd_addcredits2),
         ("addcredits3",    cmd_addcredits3),
         ("addcredits4",    cmd_addcredits4),
+        ("addcredits5",    cmd_addcredits5),
+        ("addcredits6",    cmd_addcredits6),
         ("addcreditspro",  cmd_addcreditspro),
         ("slap",           cmd_slap),
         ("hug",            cmd_hug),
