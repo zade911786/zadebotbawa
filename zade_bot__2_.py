@@ -1810,145 +1810,306 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u    = q.from_user
     await q.answer()
 
-    # ── img5 style selection ────────────────────────────────────────
+    # ── img5 ─────────────────────────────────────────────────────────
     if data.startswith("i5s:"):
-        # i5s:<style>:<safe_prompt>
+        # i5s:<style_val>:<prompt_b64>
         parts = data.split(":", 2)
         if len(parts) == 3:
-            _, style, safe_p = parts
-            full_prompt = IMG5_STATE.get(u.id, {}).get("prompt", safe_p)
-            IMG5_STATE.setdefault(u.id, {})["style"] = style
-            style_label = next((l for l, v in PRODIA_STYLES if v == style), style)
-            aspect_kb   = kb_img5_aspects(full_prompt, style)
-            aspect_text = (
+            _, style_val, p_b64 = parts
+            import base64
+            try: prompt = base64.b64decode(p_b64.encode()).decode()
+            except: prompt = p_b64
+            style_label = next((l for l, v in PRODIA_STYLES if v == style_val), style_val)
+            import json as _j
+            # Build aspect keyboard — encode prompt in b64 again
+            p_enc = base64.b64encode(prompt[:40].encode()).decode()
+            s_enc = style_val[:20]
+            aspect_kb = _j.dumps({"inline_keyboard": [
+                [
+                    {"text": "⬛ Square",    "callback_data": f"i5a:square:{s_enc}:{p_enc}",   "style": "primary"},
+                    {"text": "📱 Portrait",  "callback_data": f"i5a:portrait:{s_enc}:{p_enc}", "style": "primary"},
+                    {"text": "🖼 Landscape", "callback_data": f"i5a:landscape:{s_enc}:{p_enc}","style": "primary"},
+                ],
+                [
+                    {"text": "« Back", "callback_data": f"i5_back:{p_enc}", "style": "primary"},
+                    {"text": "❌ Cancel", "callback_data": "i5_cancel", "style": "danger"},
+                ],
+            ]})
+            txt = (
                 f"🖼 <b>Step 2 — Pick Aspect Ratio</b>\n\n"
-                f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n"
+                f"📝 Prompt: <code>{prompt[:60]}{'...' if len(prompt)>60 else ''}</code>\n"
                 f"🎨 Style: <b>{style_label}</b>\n\n"
                 f"Choose aspect ratio:"
             )
             try:
-                await q.edit_message_text(
-                    aspect_text, parse_mode="HTML",
-                    api_kwargs={"reply_markup": aspect_kb},
-                )
+                await q.edit_message_text(txt, parse_mode="HTML", api_kwargs={"reply_markup": aspect_kb})
             except Exception:
-                # Edit failed (e.g. message too old) — send fresh message
-                await q.message.reply_text(
-                    aspect_text, parse_mode="HTML",
-                    api_kwargs={"reply_markup": aspect_kb},
-                )
+                await ctx.bot.send_message(q.message.chat_id, txt, parse_mode="HTML", api_kwargs={"reply_markup": aspect_kb})
         return
 
     if data.startswith("i5a:"):
-        # i5a:<aspect>:<safe_style>:<safe_prompt>
+        # i5a:<aspect>:<style_val>:<prompt_b64>
         parts = data.split(":", 3)
         if len(parts) == 4:
-            _, aspect, safe_s, safe_p = parts
-            state = IMG5_STATE.get(u.id, {})
-            # Use state if available, else fallback to callback data values
-            full_prompt = state.get("prompt") or safe_p
-            style = state.get("style") or safe_s
-            IMG5_STATE.setdefault(u.id, {})["aspect"] = aspect
+            _, aspect, style_val, p_b64 = parts
+            import base64
+            try: prompt = base64.b64decode(p_b64.encode()).decode()
+            except: prompt = p_b64
             await q.answer(f"🖼 Generating {aspect}...")
             try: await q.edit_message_reply_markup(reply_markup=None)
             except: pass
-            # Use bot.send_message on the chat directly (not reply on old message)
-            # This avoids issues with replying to edited/old messages
-            class _ChatMsg:
-                """Minimal message-like obj that sends to the same chat."""
-                def __init__(self, chat_id, bot):
-                    self.chat_id = chat_id
-                    self.chat    = type("C", (), {"id": chat_id})()
-                    self._bot    = bot
-                async def reply_text(self, text, **kw):
-                    return await self._bot.send_message(self.chat_id, text, **kw)
-                async def reply_photo(self, photo, **kw):
-                    return await self._bot.send_photo(self.chat_id, photo, **kw)
             chat_id = q.message.chat_id
-            fake_msg = _ChatMsg(chat_id, ctx.bot)
-            await _do_prodia_gen(fake_msg, u, full_prompt, style, aspect)
-        else:
-            await q.answer("❌ Invalid data, try again.", show_alert=True)
+            # Credits check
+            is_owner = (u.id == OWNER_ID)
+            if not is_owner:
+                credits = await get_model_credits(u.id, "img5_credits")
+                if credits <= 0:
+                    await ctx.bot.send_message(chat_id,
+                        "❌ <b>No /img5 credits left!</b>\n\n"
+                        "📸 Daily free: <b>2/day</b> (resets midnight)\n"
+                        "👑 Ask owner: /addcredits5", parse_mode="HTML")
+                    return
+            style_label = next((l for l, v in PRODIA_STYLES if v == style_val), style_val)
+            username_str = f"@{u.username}" if u.username else (u.first_name or "User")
+            # Send wait message
+            wm = await ctx.bot.send_message(chat_id,
+                f"✨ <b>Generating Your Image...</b>\n"
+                f"『────────────────────』\n"
+                f"✦ 𝗠𝗼𝗱𝗲𝗹  │ <code>FLUX.2</code>\n"
+                f"✦ 𝗣𝗿𝗼𝗺𝗽𝘁 │ <code>{prompt[:50]}{'...' if len(prompt)>50 else ''}</code>\n"
+                f"✦ 𝗦𝘁𝘆𝗹𝗲  │ {style_label}\n"
+                f"✦ 𝗔𝘀𝗽𝗲𝗰𝘁 │ {aspect.upper()}\n"
+                f"✦ 𝗧𝗶𝗺𝗲   │ 5–30s\n"
+                f"❖ 𝗥𝗲𝗾𝘂𝗲𝘀𝘁𝗲𝗱 𝗯𝘆 : <b>{username_str}</b>\n"
+                f"『────────────────────』\n"
+                f"<i>🖌 Crafting your exclusive creation...</i>",
+                parse_mode="HTML")
+            import aiohttp, urllib.parse, time as _t
+            start = _t.time()
+            try:
+                enc = urllib.parse.quote_plus(prompt.strip())
+                url = f"{PRODIA_API_BASE}?prompt={enc}&style={style_val}&aspect={aspect}"
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=90)) as r:
+                        rj = await r.json(content_type=None)
+                image_url = rj.get("image_url")
+                if not image_url:
+                    err = rj.get("error") or rj.get("message") or str(rj)[:200]
+                    try: await wm.delete()
+                    except: pass
+                    await ctx.bot.send_message(chat_id, f"❌ <b>Generation failed</b>\n<code>{err}</code>", parse_mode="HTML")
+                    return
+                taken = int(_t.time() - start)
+                dims  = rj.get("dimensions", "—")
+                if not is_owner:
+                    await deduct_model_credit(u.id, "img5_credits")
+                    cl = await get_model_credits(u.id, "img5_credits")
+                    credits_line = f"📸 Credits Left • <b>{cl}</b> remaining today"
+                else:
+                    credits_line = "👑 Owner Access • Unlimited"
+                # Regen keyboard — store prompt in b64
+                import base64 as _b64, json as _j
+                p_enc2 = _b64.b64encode(prompt[:40].encode()).decode()
+                s_enc2 = style_val[:20]
+                a_enc2 = aspect[:10]
+                regen_kb = _j.dumps({"inline_keyboard": [
+                    [
+                        {"text": "🎨 Change Style",  "callback_data": f"i5_chstyle:{p_enc2}", "style": "primary"},
+                        {"text": "🖼 Change Aspect", "callback_data": f"i5_chaspect:{s_enc2}:{p_enc2}", "style": "primary"},
+                    ],
+                    [
+                        {"text": "🔁 Regenerate",   "callback_data": f"i5_regen:{s_enc2}:{a_enc2}:{p_enc2}", "style": "success"},
+                        {"text": "✅ Done",          "callback_data": "i5_cancel", "style": "danger"},
+                    ],
+                ]})
+                caption = (
+                    f"✨ <b>Image Generated!</b>\n"
+                    f"╭━━━━━━━━━━━━━━━━━━╮\n"
+                    f"│ 👤 User » {username_str}\n"
+                    f"│ 🎭 Style » {style_label}\n"
+                    f"│ 🖼 Aspect » {aspect.upper()} ({dims})\n"
+                    f"│ 📝 Prompt » {prompt[:55]}{'...' if len(prompt)>55 else ''}\n"
+                    f"│ ⚡ Time » {taken}s\n"
+                    f"╰━━━━━━━━━━━━━━━━━━╯\n"
+                    f"{credits_line}\n\n"
+                    f"🔁 <b>Regenerate or change style/aspect:</b>"
+                )
+                try: await wm.delete()
+                except: pass
+                await ctx.bot.send_photo(chat_id, photo=image_url, caption=caption, parse_mode="HTML",
+                                         api_kwargs={"reply_markup": regen_kb})
+            except asyncio.TimeoutError:
+                try: await wm.delete()
+                except: pass
+                await ctx.bot.send_message(chat_id, "❌ Timed out (90s). Try again!")
+            except Exception as e:
+                try: await wm.delete()
+                except: pass
+                await ctx.bot.send_message(chat_id, f"❌ Generation failed: {e}")
         return
 
     if data.startswith("i5_back:"):
-        safe_p = data[8:]
-        full_prompt = IMG5_STATE.get(u.id, {}).get("prompt", safe_p)
+        p_b64 = data[8:]
+        import base64, json as _j
+        try: prompt = base64.b64decode(p_b64.encode()).decode()
+        except: prompt = p_b64
+        p_enc = base64.b64encode(prompt[:40].encode()).decode()
+        style_kb = _j.dumps({"inline_keyboard":
+            [[{"text": lbl, "callback_data": f"i5s:{val}:{p_enc}", "style": "primary"}
+              for lbl, val in PRODIA_STYLES[i:i+2]]
+             for i in range(0, len(PRODIA_STYLES), 2)] +
+            [[{"text": "❌ Cancel", "callback_data": "i5_cancel", "style": "danger"}]]
+        })
+        txt = (f"🎨 <b>Pick a Style</b>\n\n"
+               f"📝 Prompt: <code>{prompt[:60]}{'...' if len(prompt)>60 else ''}</code>\n\n"
+               f"Choose an art style:")
         try:
-            await q.edit_message_text(
-                f"🎨 <b>Step 1 — Pick a Style</b>\n\n"
-                f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n\n"
-                f"Choose an art style:",
-                parse_mode="HTML",
-                api_kwargs={"reply_markup": kb_img5_styles(full_prompt)},
-            )
+            await q.edit_message_text(txt, parse_mode="HTML", api_kwargs={"reply_markup": style_kb})
         except Exception:
-            pass
+            await ctx.bot.send_message(q.message.chat_id, txt, parse_mode="HTML", api_kwargs={"reply_markup": style_kb})
         return
 
     if data.startswith("i5_chstyle:"):
-        safe_p = data[11:]
-        full_prompt = IMG5_STATE.get(u.id, {}).get("prompt", safe_p)
-        try:
-            await q.message.reply_text(
-                f"🎨 <b>Change Style</b>\n\n"
-                f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n\n"
-                f"Pick a new style:",
-                parse_mode="HTML",
-                api_kwargs={"reply_markup": kb_img5_styles(full_prompt)},
-            )
-        except Exception:
-            pass
+        p_b64 = data[11:]
+        import base64, json as _j
+        try: prompt = base64.b64decode(p_b64.encode()).decode()
+        except: prompt = p_b64
+        p_enc = base64.b64encode(prompt[:40].encode()).decode()
+        style_kb = _j.dumps({"inline_keyboard":
+            [[{"text": lbl, "callback_data": f"i5s:{val}:{p_enc}", "style": "primary"}
+              for lbl, val in PRODIA_STYLES[i:i+2]]
+             for i in range(0, len(PRODIA_STYLES), 2)] +
+            [[{"text": "❌ Cancel", "callback_data": "i5_cancel", "style": "danger"}]]
+        })
+        txt = (f"🎨 <b>Change Style</b>\n\n"
+               f"📝 Prompt: <code>{prompt[:60]}{'...' if len(prompt)>60 else ''}</code>\n\n"
+               f"Pick a new style:")
+        await ctx.bot.send_message(q.message.chat_id, txt, parse_mode="HTML", api_kwargs={"reply_markup": style_kb})
         return
 
     if data.startswith("i5_chaspect:"):
         rest = data[12:]
-        safe_s, safe_p = rest.split(":", 1) if ":" in rest else (rest, "")
-        state = IMG5_STATE.get(u.id, {})
-        full_prompt = state.get("prompt", safe_p)
-        style = state.get("style", safe_s)
-        try:
-            await q.message.reply_text(
-                f"🖼 <b>Change Aspect Ratio</b>\n\n"
-                f"📝 Prompt: <code>{full_prompt[:60]}{'...' if len(full_prompt)>60 else ''}</code>\n\n"
-                f"Pick a new aspect:",
-                parse_mode="HTML",
-                api_kwargs={"reply_markup": kb_img5_aspects(full_prompt, style)},
-            )
-        except Exception:
-            pass
+        s_enc, p_b64 = rest.split(":", 1) if ":" in rest else (rest, "")
+        import base64, json as _j
+        try: prompt = base64.b64decode(p_b64.encode()).decode()
+        except: prompt = p_b64
+        p_enc = base64.b64encode(prompt[:40].encode()).decode()
+        aspect_kb = _j.dumps({"inline_keyboard": [
+            [
+                {"text": "⬛ Square",    "callback_data": f"i5a:square:{s_enc}:{p_enc}",   "style": "primary"},
+                {"text": "📱 Portrait",  "callback_data": f"i5a:portrait:{s_enc}:{p_enc}", "style": "primary"},
+                {"text": "🖼 Landscape", "callback_data": f"i5a:landscape:{s_enc}:{p_enc}","style": "primary"},
+            ],
+            [{"text": "❌ Cancel", "callback_data": "i5_cancel", "style": "danger"}],
+        ]})
+        txt = (f"🖼 <b>Change Aspect Ratio</b>\n\n"
+               f"📝 Prompt: <code>{prompt[:60]}{'...' if len(prompt)>60 else ''}</code>\n\n"
+               f"Pick a new aspect:")
+        await ctx.bot.send_message(q.message.chat_id, txt, parse_mode="HTML", api_kwargs={"reply_markup": aspect_kb})
         return
 
     if data.startswith("i5_regen:"):
-        # i5_regen:<safe_style>:<safe_aspect>:<safe_prompt>
         rest = data[9:]
         parts = rest.split(":", 2)
         if len(parts) == 3:
-            safe_s, safe_a, safe_p = parts
-            state = IMG5_STATE.get(u.id, {})
-            full_prompt = state.get("prompt") or safe_p
-            style  = state.get("style")  or safe_s
-            aspect = state.get("aspect") or safe_a
+            s_enc, a_enc, p_b64 = parts
+            import base64
+            try: prompt = base64.b64decode(p_b64.encode()).decode()
+            except: prompt = p_b64
             await q.answer("🔁 Regenerating...")
             try: await q.edit_message_reply_markup(reply_markup=None)
             except: pass
-            class _ChatMsg:
-                def __init__(self, chat_id, bot):
-                    self.chat_id = chat_id
-                    self.chat    = type("C", (), {"id": chat_id})()
-                    self._bot    = bot
-                async def reply_text(self, text, **kw):
-                    return await self._bot.send_message(self.chat_id, text, **kw)
-                async def reply_photo(self, photo, **kw):
-                    return await self._bot.send_photo(self.chat_id, photo, **kw)
-            await _do_prodia_gen(_ChatMsg(q.message.chat_id, ctx.bot), u, full_prompt, style, aspect)
+            # Re-trigger i5a logic by faking callback data and re-entering
+            # Simpler: directly call the generation inline
+            chat_id = q.message.chat_id
+            style_val = s_enc
+            aspect    = a_enc
+            is_owner = (u.id == OWNER_ID)
+            if not is_owner:
+                credits = await get_model_credits(u.id, "img5_credits")
+                if credits <= 0:
+                    await ctx.bot.send_message(chat_id,
+                        "❌ <b>No /img5 credits left!</b>\n\n"
+                        "📸 Daily free: <b>2/day</b> (resets midnight)\n"
+                        "👑 Ask owner: /addcredits5", parse_mode="HTML")
+                    return
+            style_label  = next((l for l, v in PRODIA_STYLES if v == style_val), style_val)
+            username_str = f"@{u.username}" if u.username else (u.first_name or "User")
+            wm = await ctx.bot.send_message(chat_id,
+                f"✨ <b>Regenerating...</b>\n"
+                f"『────────────────────』\n"
+                f"✦ 𝗠𝗼𝗱𝗲𝗹  │ <code>FLUX.2</code>\n"
+                f"✦ 𝗣𝗿𝗼𝗺𝗽𝘁 │ <code>{prompt[:50]}{'...' if len(prompt)>50 else ''}</code>\n"
+                f"✦ 𝗦𝘁𝘆𝗹𝗲  │ {style_label}\n"
+                f"✦ 𝗔𝘀𝗽𝗲𝗰𝘁 │ {aspect.upper()}\n"
+                f"『────────────────────』\n"
+                f"<i>🖌 Crafting your exclusive creation...</i>",
+                parse_mode="HTML")
+            import aiohttp, urllib.parse, time as _t, base64 as _b64, json as _j
+            start = _t.time()
+            try:
+                enc = urllib.parse.quote_plus(prompt.strip())
+                url = f"{PRODIA_API_BASE}?prompt={enc}&style={style_val}&aspect={aspect}"
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=90)) as r:
+                        rj = await r.json(content_type=None)
+                image_url = rj.get("image_url")
+                if not image_url:
+                    err = rj.get("error") or rj.get("message") or str(rj)[:200]
+                    try: await wm.delete()
+                    except: pass
+                    await ctx.bot.send_message(chat_id, f"❌ <b>Generation failed</b>\n<code>{err}</code>", parse_mode="HTML")
+                    return
+                taken = int(_t.time() - start)
+                dims  = rj.get("dimensions", "—")
+                if not is_owner:
+                    await deduct_model_credit(u.id, "img5_credits")
+                    cl = await get_model_credits(u.id, "img5_credits")
+                    credits_line = f"📸 Credits Left • <b>{cl}</b> remaining today"
+                else:
+                    credits_line = "👑 Owner Access • Unlimited"
+                p_enc2 = _b64.b64encode(prompt[:40].encode()).decode()
+                regen_kb = _j.dumps({"inline_keyboard": [
+                    [
+                        {"text": "🎨 Change Style",  "callback_data": f"i5_chstyle:{p_enc2}", "style": "primary"},
+                        {"text": "🖼 Change Aspect", "callback_data": f"i5_chaspect:{style_val[:20]}:{p_enc2}", "style": "primary"},
+                    ],
+                    [
+                        {"text": "🔁 Regenerate",   "callback_data": f"i5_regen:{style_val[:20]}:{aspect[:10]}:{p_enc2}", "style": "success"},
+                        {"text": "✅ Done",          "callback_data": "i5_cancel", "style": "danger"},
+                    ],
+                ]})
+                caption = (
+                    f"✨ <b>Image Generated!</b>\n"
+                    f"╭━━━━━━━━━━━━━━━━━━╮\n"
+                    f"│ 👤 User » {username_str}\n"
+                    f"│ 🎭 Style » {style_label}\n"
+                    f"│ 🖼 Aspect » {aspect.upper()} ({dims})\n"
+                    f"│ 📝 Prompt » {prompt[:55]}{'...' if len(prompt)>55 else ''}\n"
+                    f"│ ⚡ Time » {taken}s\n"
+                    f"╰━━━━━━━━━━━━━━━━━━╯\n"
+                    f"{credits_line}\n\n"
+                    f"🔁 <b>Regenerate or change style/aspect:</b>"
+                )
+                try: await wm.delete()
+                except: pass
+                await ctx.bot.send_photo(chat_id, photo=image_url, caption=caption, parse_mode="HTML",
+                                         api_kwargs={"reply_markup": regen_kb})
+            except asyncio.TimeoutError:
+                try: await wm.delete()
+                except: pass
+                await ctx.bot.send_message(chat_id, "❌ Timed out (90s). Try again!")
+            except Exception as e:
+                try: await wm.delete()
+                except: pass
+                await ctx.bot.send_message(chat_id, f"❌ Generation failed: {e}")
         return
 
     if data == "i5_cancel":
         IMG5_STATE.pop(u.id, None)
         try: await q.edit_message_reply_markup(reply_markup=None)
         except: pass
-        await q.answer("✅ Cancelled.")
+        await q.answer("✅ Done.")
         return
 
     # ── img6 callbacks ─────────────────────────────────
