@@ -1845,15 +1845,30 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(parts) == 4:
             _, aspect, safe_s, safe_p = parts
             state = IMG5_STATE.get(u.id, {})
-            full_prompt = state.get("prompt", safe_p)
-            style = state.get("style", safe_s)
+            # Use state if available, else fallback to callback data values
+            full_prompt = state.get("prompt") or safe_p
+            style = state.get("style") or safe_s
             IMG5_STATE.setdefault(u.id, {})["aspect"] = aspect
             await q.answer(f"🖼 Generating {aspect}...")
-            # Remove keyboard from aspect picker message
             try: await q.edit_message_reply_markup(reply_markup=None)
             except: pass
-            # Send generation directly via bot (not as reply to old message)
-            await _do_prodia_gen(q.message, u, full_prompt, style, aspect)
+            # Use bot.send_message on the chat directly (not reply on old message)
+            # This avoids issues with replying to edited/old messages
+            class _ChatMsg:
+                """Minimal message-like obj that sends to the same chat."""
+                def __init__(self, chat_id, bot):
+                    self.chat_id = chat_id
+                    self.chat    = type("C", (), {"id": chat_id})()
+                    self._bot    = bot
+                async def reply_text(self, text, **kw):
+                    return await self._bot.send_message(self.chat_id, text, **kw)
+                async def reply_photo(self, photo, **kw):
+                    return await self._bot.send_photo(self.chat_id, photo, **kw)
+            chat_id = q.message.chat_id
+            fake_msg = _ChatMsg(chat_id, ctx.bot)
+            await _do_prodia_gen(fake_msg, u, full_prompt, style, aspect)
+        else:
+            await q.answer("❌ Invalid data, try again.", show_alert=True)
         return
 
     if data.startswith("i5_back:"):
@@ -1911,13 +1926,22 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(parts) == 3:
             safe_s, safe_a, safe_p = parts
             state = IMG5_STATE.get(u.id, {})
-            full_prompt = state.get("prompt", safe_p)
-            style  = state.get("style",  safe_s)
-            aspect = state.get("aspect", safe_a)
+            full_prompt = state.get("prompt") or safe_p
+            style  = state.get("style")  or safe_s
+            aspect = state.get("aspect") or safe_a
             await q.answer("🔁 Regenerating...")
             try: await q.edit_message_reply_markup(reply_markup=None)
             except: pass
-            await _do_prodia_gen(q.message, u, full_prompt, style, aspect)
+            class _ChatMsg:
+                def __init__(self, chat_id, bot):
+                    self.chat_id = chat_id
+                    self.chat    = type("C", (), {"id": chat_id})()
+                    self._bot    = bot
+                async def reply_text(self, text, **kw):
+                    return await self._bot.send_message(self.chat_id, text, **kw)
+                async def reply_photo(self, photo, **kw):
+                    return await self._bot.send_photo(self.chat_id, photo, **kw)
+            await _do_prodia_gen(_ChatMsg(q.message.chat_id, ctx.bot), u, full_prompt, style, aspect)
         return
 
     if data == "i5_cancel":
