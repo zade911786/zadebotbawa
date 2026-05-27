@@ -3404,15 +3404,25 @@ async def cmd_img5(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ); return
 
     prompt = " ".join(ctx.args).strip()
-    # Store state so callbacks can reference full prompt
-    IMG5_STATE[u.id] = {"prompt": prompt, "chat_id": update.effective_chat.id}
+    import base64, json as _j
+    # Encode prompt in base64 so full prompt survives in callback_data
+    p_enc = base64.b64encode(prompt[:40].encode()).decode()
+
+    rows = []
+    for i in range(0, len(PRODIA_STYLES), 2):
+        row = []
+        for label, val in PRODIA_STYLES[i:i+2]:
+            row.append({"text": label, "callback_data": f"i5s:{val}:{p_enc}", "style": "primary"})
+        rows.append(row)
+    rows.append([{"text": "❌ Cancel", "callback_data": "i5_cancel", "style": "danger"}])
+    style_kb = _j.dumps({"inline_keyboard": rows})
 
     await update.message.reply_text(
         f"🎨 <b>Step 1 — Pick a Style</b>\n\n"
         f"📝 Prompt: <code>{prompt[:60]}{'...' if len(prompt)>60 else ''}</code>\n\n"
         f"Choose an art style:",
         parse_mode="HTML",
-        api_kwargs={"reply_markup": kb_img5_styles(prompt)},
+        api_kwargs={"reply_markup": style_kb},
     )
 
 
